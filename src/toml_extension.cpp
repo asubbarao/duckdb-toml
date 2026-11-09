@@ -3,8 +3,10 @@
 #include "toml_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table_function.hpp"
 
 #define TOML_ENABLE_FORMATTERS 0
 #include "toml.hpp"
@@ -105,36 +107,92 @@ yyjson_mut_val *TomlToJson(yyjson_mut_doc *doc, const toml::node &node) {
 	}
 }
 
+// Parses one TOML document and adds it to result's string heap as JSON; source names the file in errors
+string_t TomlDocumentToJson(Vector &result, std::string_view input, const std::string &source) {
+	toml::table table;
+	try {
+		table = toml::parse(input);
+	} catch (const toml::parse_error &err) {
+		auto &region = err.source();
+		throw InvalidInputException("Invalid TOML%s at line %llu, column %llu: %s",
+		                            source.empty() ? "" : " in " + source,
+		                            static_cast<unsigned long long>(region.begin.line),
+		                            static_cast<unsigned long long>(region.begin.column), std::string(err.description()));
+	}
+	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> doc(yyjson_mut_doc_new(nullptr),
+	                                                                    yyjson_mut_doc_free);
+	yyjson_mut_doc_set_root(doc.get(), TomlToJson(doc.get(), table));
+	size_t len;
+	char *json = yyjson_mut_write(doc.get(), 0, &len);
+	if (!json) {
+		throw InternalException("toml: failed to serialize JSON");
+	}
+	auto out = StringVector::AddString(result, json, len);
+	free(json);
+	return out;
+}
+
 void ParseTomlFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t input) {
-		toml::table table;
-		try {
-			table = toml::parse(std::string_view(input.GetData(), input.GetSize()));
-		} catch (const toml::parse_error &err) {
-			auto &region = err.source();
-			throw InvalidInputException(
-			    "Invalid TOML at line %llu, column %llu: %s", static_cast<unsigned long long>(region.begin.line),
-			    static_cast<unsigned long long>(region.begin.column), std::string(err.description()));
-		}
-		std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> doc(yyjson_mut_doc_new(nullptr),
-		                                                                    yyjson_mut_doc_free);
-		yyjson_mut_doc_set_root(doc.get(), TomlToJson(doc.get(), table));
-		size_t len;
-		char *json = yyjson_mut_write(doc.get(), 0, &len);
-		if (!json) {
-			throw InternalException("parse_toml: failed to serialize JSON");
-		}
-		auto out = StringVector::AddString(result, json, len);
-		free(json);
-		return out;
+		return TomlDocumentToJson(result, std::string_view(input.GetData(), input.GetSize()), "");
 	});
+}
+
+//------------------------------------------------------------------------------
+// read_toml(path or glob): one row per file, (filename VARCHAR, toml JSON)
+//------------------------------------------------------------------------------
+
+struct ReadTomlBindData : public TableFunctionData {
+	vector<OpenFileInfo> files;
+};
+
+struct ReadTomlGlobalState : public GlobalTableFunctionState {
+	idx_t next_file = 0;
+};
+
+unique_ptr<FunctionData> ReadTomlBind(ClientContext &context, TableFunctionBindInput &input,
+                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto result = make_uniq<ReadTomlBindData>();
+	auto &fs = FileSystem::GetFileSystem(context);
+	result->files = fs.GlobFiles(StringValue::Get(input.inputs[0]), FileGlobOptions::DISALLOW_EMPTY);
+	return_types = {LogicalType::VARCHAR, LogicalType::JSON()};
+	names.emplace_back("filename");
+	names.emplace_back("toml");
+	return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> ReadTomlInit(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<ReadTomlGlobalState>();
+}
+
+void ReadTomlFun(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<ReadTomlBindData>();
+	auto &state = data.global_state->Cast<ReadTomlGlobalState>();
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto filenames = FlatVector::GetDataMutable<string_t>(output.data[0]);
+	auto documents = FlatVector::GetDataMutable<string_t>(output.data[1]);
+	idx_t count = 0;
+	while (state.next_file < bind_data.files.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &file = bind_data.files[state.next_file++];
+		auto handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ);
+		std::string content(handle->GetFileSize(), '\0');
+		handle->Read(content.data(), content.size());
+		filenames[count] = StringVector::AddString(output.data[0], file.path);
+		documents[count] = TomlDocumentToJson(output.data[1], content, file.path);
+		count++;
+	}
+	output.SetChildCardinality(count);
 }
 
 } // namespace
 
 static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction parse_toml_function("parse_toml", {LogicalType::VARCHAR}, LogicalType::JSON(), ParseTomlFun);
+	// invalid TOML throws InvalidInputException; 2.0 turns a throw from a non-fallible function into an internal error
+	parse_toml_function.SetFallible();
 	loader.RegisterFunction(parse_toml_function);
+	TableFunction read_toml_function("read_toml", {LogicalType::VARCHAR}, ReadTomlFun, ReadTomlBind, ReadTomlInit);
+	loader.RegisterFunction(read_toml_function);
 }
 
 void TomlExtension::Load(ExtensionLoader &loader) {

@@ -1,0 +1,36 @@
+# name: test/sql/read_toml.test
+# description: test read_toml
+# group: [sql]
+
+require toml
+
+require json
+
+# One row per file: its path and the document as JSON
+query II
+SELECT filename, toml FROM read_toml('test/data/config.toml');
+----
+test/data/config.toml	{"server":{"host":"localhost","port":5432},"title":"sample"}
+
+query II
+SELECT typeof(filename), typeof(toml) FROM read_toml('test/data/config.toml');
+----
+VARCHAR	JSON
+
+# Globs expand to every matching file
+query I
+SELECT toml->'server'->>'host' FROM read_toml('test/data/*.toml') ORDER BY filename;
+----
+localhost
+
+# A path that matches nothing is an error, like read_text
+statement error
+SELECT * FROM read_toml('test/data/missing_*.toml');
+----
+No files found
+
+# A parse error names the file
+statement error
+SELECT * FROM read_toml('test/data/broken.toml.txt');
+----
+Invalid TOML in test/data/broken.toml.txt at line 1
